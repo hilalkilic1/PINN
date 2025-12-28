@@ -1,0 +1,111 @@
+import torch
+import torch.nn as nn
+import torch.autograd as autograd
+import matplotlib.pyplot as plt
+
+class MetricPINN(nn.Module):
+    def __init__(self, hidden=32, layers=3):
+        super().__init__()
+
+        net = [nn.Linear(1, hidden), nn.Tanh()]
+        for _ in range(layers - 1):
+            net += [nn.Linear(hidden, hidden), nn.Tanh()]
+        net.append(nn.Linear(hidden, 1))  # f_tilde(r)
+
+        self.net = nn.Sequential(*net)
+
+    def forward(self, r):
+        return self.net(r)
+
+def grad(u, x):
+    g = autograd.grad(
+        u,
+        x,
+        grad_outputs=torch.ones_like(u),
+        create_graph=True,
+        allow_unused=True
+    )[0]
+    return torch.zeros_like(x) if g is None else g
+
+def s_grad(u, x):
+    return grad(grad(u, x), x)
+
+def einstein_res(f, g, r):
+    eps = 1e-6
+    f_safe = f + eps
+    g_safe = g + eps
+
+    f_r = grad(f, r)
+    f_rr = s_grad(f, r)
+    g_r = grad(g, r)
+
+    R_tt = (
+        f_rr / (2 * g_safe)
+        - f_r / (4 * g_safe) * (f_r / f_safe + g_r / g_safe)
+        + f_r / (r * g_safe)
+    )
+
+    return R_tt
+
+# Near-horizon
+r_h = 1.0
+eps = 0.1
+delta = 1e-4
+N = 200
+
+r = torch.linspace(
+    r_h + delta,
+    r_h + eps,
+    N,
+    requires_grad=True
+).view(-1, 1)
+
+model = MetricPINN()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# norm point
+r0 = torch.tensor([[1.01]], requires_grad=True)
+
+for epoch in range(2000):
+    optimizer.zero_grad()
+
+    f_tilde = model(r)
+    f = (r - 1.0) * f_tilde
+    g = 1.0 / (f + 1e-6)
+
+    # Einstein PDE loss
+    R_tt = einstein_res(f, g, r)
+    scale = torch.abs(R_tt.detach()).mean() + 1.0
+    loss_pde = ((R_tt / scale) ** 2).mean()
+
+    # gauge
+    f0 = (r0 - 1.0) * model(r0)
+    df_dr_0 = grad(f0, r0)
+    loss_norm = (df_dr_0 - 1.0) ** 2
+
+    loss = loss_pde + loss_norm
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 200 == 0:
+        print(f"Epoch {epoch:4d} | Loss: {loss.item():.3e}")
+
+with torch.no_grad():
+    f = (r - 1.0) * model(r)
+
+plt.plot(
+    r.detach().cpu().numpy(),
+    f.detach().cpu().numpy(),
+    label="PINN f(r)"
+)
+plt.plot(
+    r.detach().cpu().numpy(),
+    (r - 1.0).detach().cpu().numpy(),
+    "--",
+    label="Exact near-horizon"
+)
+
+plt.xlabel("r")
+plt.ylabel("f(r)")
+plt.legend()
+plt.show()
